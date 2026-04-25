@@ -7,10 +7,10 @@ import requests
 import pandas as pd
 import streamlit as st
 
-from bs4 import BeautifulSoup
-from datetime import date, datetime
-from urllib.parse import urlparse, urljoin
 from io import BytesIO
+from datetime import datetime
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
 
 try:
     from playwright.sync_api import sync_playwright
@@ -18,400 +18,1072 @@ try:
 except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
+
+BASE_OUTPUT_DIR = os.path.expanduser("~/Desktop/website-scraper-app")
+LOGS_DIR = os.path.join(BASE_OUTPUT_DIR, "logs")
+HISTORY_FILE = os.path.join(LOGS_DIR, "app_scrape_history.csv")
+
+os.makedirs(LOGS_DIR, exist_ok=True)
+
 HEADERS = {
-    "User-Agent": "Mozilla/5.0"
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
-BASE_OUTPUT_DIR = os.path.expanduser("~/Desktop/website scraper")
-HISTORY_DIR = os.path.join(BASE_OUTPUT_DIR, "logs")
-HISTORY_FILE = os.path.join(HISTORY_DIR, "app_scrape_history.csv")
 
-COMMON_PRODUCT_LISTING_PATHS = [
-    "/shop/",
-    "/products/",
-    "/collections/all/",
-    "/collections/",
-    "/store/",
-]
-
-EXCLUDED_URL_PARTS = [
-    "/cart",
-    "/checkout",
-    "/account",
-    "/login",
-    "/admin",
-    "/wp-admin",
+OUTPUT_COLUMNS = [
+    "source", "site", "product_name", "variant_name", "brand",
+    "price", "compare_at_price", "currency", "availability",
+    "product_url", "image_url", "description", "category",
+    "sku", "barcode", "vendor", "product_type", "variant_count",
+    "variant_id", "product_id", "variants", "tags", "scraped_at",
 ]
 
 
-def normalize_base_url(url):
-    if not url.startswith("http"):
-        url = "https://" + url
-    parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}"
+CLEAN_EXPORT_COLUMNS = [
+    "product_name", "variant_name", "price", "compare_at_price",
+    "currency", "availability", "sku", "barcode", "brand",
+    "vendor", "product_type", "image_url", "product_url", "description",
+]
 
 
-def clean_site_name(url):
-    domain = urlparse(url).netloc.lower().replace("www.", "")
-    return re.sub(r"[^a-zA-Z0-9_-]", "", domain.split(".")[0])
+HISTORY_COLUMNS = [
+    "scraped_at",
+    "url",
+    "total_rows",
+    "exported_rows",
+    "variant_expansion",
+    "export_mode",
+    "csv_path",
+    "excel_path",
+]
 
 
-def is_safe_url(url):
-    return not any(part in url.lower() for part in EXCLUDED_URL_PARTS)
+def clean_text(value):
+    if value is None:
+        return ""
+    value = str(value)
+    value = BeautifulSoup(value, "lxml").get_text(" ", strip=True)
+    return re.sub(r"\s+", " ", value).strip()
 
 
-def ensure_dirs(site_name):
-    site_folder = os.path.join(BASE_OUTPUT_DIR, site_name)
-    os.makedirs(site_folder, exist_ok=True)
-    os.makedirs(HISTORY_DIR, exist_ok=True)
-    return site_folder
+def clean_price(value):
+    if value is None:
+        return ""
+    value = str(value).strip().replace(",", "")
+    match = re.search(r"(\d+(?:\.\d{1,2})?)", value)
+    return match.group(1) if match else ""
 
 
-def try_shopify(base_url, log):
+def price_to_float(value):
+    cleaned = clean_price(value)
+    if cleaned == "":
+        return None
+    try:
+        return float(cleaned)
+    except Exception:
+        return None
+
+
+def detect_currency(value, fallback="USD"):
+    if not value:
+        return fallback
+    value = str(value)
+    if "$" in value:
+        return "USD"
+    if "€" in value:
+        return "EUR"
+    if "£" in value:
+        return "GBP"
+    if "CAD" in value.upper():
+        return "CAD"
+    if "AUD" in value.upper():
+        return "AUD"
+    return fallback
+
+
+def normalize_url(base_url, possible_url):
+    if not possible_url:
+        return ""
+    possible_url = str(possible_url).strip()
+    if possible_url.startswith("//"):
+        return "https:" + possible_url
+    return urljoin(base_url, possible_url)
+
+
+def normalize_availability(value):
+    if value is None:
+        return ""
+
+    value = str(value).lower().strip()
+
+    if value in ["true", "instock", "in stock", "available", "https://schema.org/instock"]:
+        return "In stock"
+
+    if value in ["false", "outofstock", "out of stock", "sold out", "https://schema.org/outofstock"]:
+        return "Out of stock"
+
+    if "instock" in value or "in stock" in value:
+        return "In stock"
+
+    if "outofstock" in value or "out of stock" in value or "sold out" in value:
+        return "Out of stock"
+
+    return clean_text(value)
+
+
+def get_site_name(url):
+    return urlparse(url).netloc.replace("www.", "")
+
+
+def make_empty_product(base_url, source):
+    return {
+        "source": source,
+        "site": get_site_name(base_url),
+        "product_name": "",
+        "variant_name": "",
+        "brand": "",
+        "price": "",
+        "compare_at_price": "",
+        "currency": "USD",
+        "availability": "",
+        "product_url": "",
+        "image_url": "",
+        "description": "",
+        "category": "",
+        "sku": "",
+        "barcode": "",
+        "vendor": "",
+        "product_type": "",
+        "variant_count": "",
+        "variant_id": "",
+        "product_id": "",
+        "variants": "",
+        "tags": "",
+        "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def dedupe_products(products):
+    seen = set()
+    deduped = []
+
+    for product in products:
+        product_name = clean_text(product.get("product_name", ""))
+        variant_name = clean_text(product.get("variant_name", ""))
+        product_url = clean_text(product.get("product_url", ""))
+        sku = clean_text(product.get("sku", ""))
+        variant_id = clean_text(product.get("variant_id", ""))
+
+        if not product_name:
+            continue
+
+        key = variant_id or sku or f"{product_url}|{product_name}|{variant_name}"
+
+        if not key.strip("|"):
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        deduped.append(product)
+
+    return deduped
+
+
+def normalize_products(products):
+    normalized = []
+
+    for product in products:
+        clean_product = {}
+
+        for column in OUTPUT_COLUMNS:
+            clean_product[column] = clean_text(product.get(column, ""))
+
+        if not clean_product["product_name"]:
+            continue
+
+        price_val = price_to_float(clean_product.get("price", ""))
+        compare_val = price_to_float(clean_product.get("compare_at_price", ""))
+
+        clean_product["price"] = price_val if price_val is not None else ""
+        clean_product["compare_at_price"] = compare_val if compare_val is not None else ""
+        clean_product["availability"] = normalize_availability(clean_product.get("availability", ""))
+
+        if not clean_product.get("currency"):
+            clean_product["currency"] = "USD"
+
+        normalized.append(clean_product)
+
+    return dedupe_products(normalized)
+
+
+def fetch_url(url, timeout=20):
+    response = requests.get(url, headers=HEADERS, timeout=timeout)
+    response.raise_for_status()
+    return response
+
+
+def build_shopify_variant_rows(base_url, product, expand_variants):
+    rows = []
+
+    title = product.get("title") or ""
+    if not title:
+        return rows
+
+    handle = product.get("handle") or ""
+    vendor = product.get("vendor") or ""
+    product_type = product.get("product_type") or ""
+    tags = product.get("tags") or []
+    variants = product.get("variants") or []
+    images = product.get("images") or []
+    product_id = product.get("id") or ""
+
+    product_url = urljoin(base_url.rstrip("/") + "/", f"products/{handle}") if handle else base_url
+
+    raw_html = product.get("body_html") or ""
+    description = BeautifulSoup(str(raw_html), "lxml").get_text(" ", strip=True)
+
+    image_url = images[0].get("src") if images else ""
+
+    variant_rows = []
+
+    for variant in variants:
+        variant_rows.append({
+            "id": variant.get("id") or "",
+            "title": variant.get("title") or "",
+            "price": variant.get("price") or "",
+            "compare_at_price": variant.get("compare_at_price") or "",
+            "sku": variant.get("sku") or "",
+            "barcode": variant.get("barcode") or "",
+            "available": variant.get("available"),
+        })
+
+    tags_text = ", ".join(tags) if isinstance(tags, list) else str(tags)
+    variants_json = json.dumps(variant_rows, ensure_ascii=False)
+
+    if expand_variants and variants:
+        for variant in variants:
+            item = make_empty_product(base_url, "Shopify products.json - variant row")
+
+            variant_title = variant.get("title") or ""
+            if variant_title.lower() == "default title":
+                variant_title = ""
+
+            item.update({
+                "product_name": title,
+                "variant_name": variant_title,
+                "brand": vendor,
+                "price": variant.get("price") or "",
+                "compare_at_price": variant.get("compare_at_price") or "",
+                "currency": "USD",
+                "availability": "In stock" if variant.get("available") else "Out of stock",
+                "product_url": product_url,
+                "image_url": image_url,
+                "description": description,
+                "category": product_type,
+                "sku": variant.get("sku") or "",
+                "barcode": variant.get("barcode") or "",
+                "vendor": vendor,
+                "product_type": product_type,
+                "variant_count": len(variants),
+                "variant_id": variant.get("id") or "",
+                "product_id": product_id,
+                "variants": variants_json,
+                "tags": tags_text,
+            })
+
+            rows.append(item)
+
+    else:
+        item = make_empty_product(base_url, "Shopify products.json - product row")
+
+        available_any = False
+        prices = []
+        compare_prices = []
+        sku = ""
+        barcode = ""
+
+        for variant in variants:
+            if variant.get("available"):
+                available_any = True
+
+            if variant.get("price"):
+                prices.append(str(variant.get("price")))
+
+            if variant.get("compare_at_price"):
+                compare_prices.append(str(variant.get("compare_at_price")))
+
+            if not sku and variant.get("sku"):
+                sku = variant.get("sku")
+
+            if not barcode and variant.get("barcode"):
+                barcode = variant.get("barcode")
+
+        clean_prices = [float(clean_price(p)) for p in prices if clean_price(p)]
+        clean_compare_prices = [float(clean_price(p)) for p in compare_prices if clean_price(p)]
+
+        item.update({
+            "product_name": title,
+            "variant_name": "",
+            "brand": vendor,
+            "price": min(clean_prices) if clean_prices else "",
+            "compare_at_price": min(clean_compare_prices) if clean_compare_prices else "",
+            "currency": "USD",
+            "availability": "In stock" if available_any else "Out of stock",
+            "product_url": product_url,
+            "image_url": image_url,
+            "description": description,
+            "category": product_type,
+            "sku": sku,
+            "barcode": barcode,
+            "vendor": vendor,
+            "product_type": product_type,
+            "variant_count": len(variants),
+            "variant_id": "",
+            "product_id": product_id,
+            "variants": variants_json,
+            "tags": tags_text,
+        })
+
+        rows.append(item)
+
+    return rows
+
+
+def scrape_shopify(base_url, log, expand_variants=False):
     products = []
     page = 1
 
+    log.append("Checking Shopify products.json endpoint...")
+
     while True:
-        url = f"{base_url}/products.json?limit=250&page={page}"
+        products_url = urljoin(base_url.rstrip("/") + "/", f"products.json?limit=250&page={page}")
 
         try:
-            response = requests.get(url, headers=HEADERS, timeout=20)
-        except Exception:
-            break
-
-        if response.status_code != 200:
-            break
-
-        try:
+            response = fetch_url(products_url)
             data = response.json()
-        except Exception:
+        except Exception as error:
+            if page == 1:
+                log.append(f"Shopify endpoint unavailable or blocked: {error}")
             break
 
-        items = data.get("products", [])
+        page_products = data.get("products", [])
 
-        if not items:
+        if not page_products:
             break
 
-        for product in items:
-            variants = product.get("variants", [])
+        log.append(f"Shopify page {page}: found {len(page_products)} products.")
 
-            raw_html = product.get("body_html") or ""
-            description = BeautifulSoup(str(raw_html), "lxml").get_text(" ", strip=True)
+        for product in page_products:
+            products.extend(build_shopify_variant_rows(base_url, product, expand_variants))
 
-            products.append({
-                "name": product.get("title", ""),
-                "price": variants[0].get("price", "") if variants else "",
-                "description": description,
-                "url": f"{base_url}/products/{product.get('handle', '')}"
-            })
-
-        log.append(f"Shopify page {page}: found {len(items)} products")
         page += 1
-        time.sleep(0.5)
+        time.sleep(0.25)
 
     return products
 
 
-def extract_json_ld_products(html, page_url):
-    soup = BeautifulSoup(html, "lxml")
+def extract_json_ld_products(base_url, soup):
     products = []
 
-    for script in soup.find_all("script", type="application/ld+json"):
+    scripts = soup.find_all("script", type="application/ld+json")
+
+    for script in scripts:
         try:
             raw = script.string or script.get_text()
             data = json.loads(raw)
-            items = data if isinstance(data, list) else [data]
-
-            expanded = []
-            for item in items:
-                expanded.append(item)
-                if isinstance(item, dict) and "@graph" in item:
-                    expanded.extend(item["@graph"])
-
-            for item in expanded:
-                if not isinstance(item, dict):
-                    continue
-
-                item_type = item.get("@type", "")
-                is_product = "Product" in item_type if isinstance(item_type, list) else item_type == "Product"
-
-                if not is_product:
-                    continue
-
-                offers = item.get("offers", {})
-                price = ""
-
-                if isinstance(offers, dict):
-                    price = offers.get("price", "")
-                elif isinstance(offers, list) and offers:
-                    price = offers[0].get("price", "")
-
-                products.append({
-                    "name": item.get("name", ""),
-                    "price": price,
-                    "description": item.get("description", ""),
-                    "url": page_url,
-                })
         except Exception:
             continue
+
+        candidates = []
+
+        if isinstance(data, list):
+            candidates.extend(data)
+        elif isinstance(data, dict):
+            candidates.append(data)
+
+            graph = data.get("@graph")
+            if isinstance(graph, list):
+                candidates.extend(graph)
+
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+
+            item_type = candidate.get("@type")
+
+            if isinstance(item_type, list):
+                is_product = "Product" in item_type
+            else:
+                is_product = item_type == "Product"
+
+            if not is_product:
+                continue
+
+            product_name = clean_text(candidate.get("name", ""))
+
+            if not product_name:
+                continue
+
+            offers = candidate.get("offers", {})
+            if isinstance(offers, list):
+                offers = offers[0] if offers else {}
+
+            image = candidate.get("image", "")
+            if isinstance(image, list):
+                image = image[0] if image else ""
+
+            brand = candidate.get("brand", "")
+            if isinstance(brand, dict):
+                brand = brand.get("name", "")
+
+            price = ""
+            currency = "USD"
+            availability = ""
+
+            if isinstance(offers, dict):
+                price = offers.get("price", "")
+                currency = offers.get("priceCurrency", "USD")
+                availability = normalize_availability(offers.get("availability", ""))
+
+            item = make_empty_product(base_url, "JSON-LD")
+
+            item.update({
+                "product_name": product_name,
+                "variant_name": "",
+                "brand": brand,
+                "price": price,
+                "compare_at_price": "",
+                "currency": currency,
+                "availability": availability,
+                "product_url": normalize_url(base_url, candidate.get("url", "")) or base_url,
+                "image_url": normalize_url(base_url, image),
+                "description": candidate.get("description", ""),
+                "category": candidate.get("category", ""),
+                "sku": candidate.get("sku", ""),
+                "barcode": candidate.get("gtin13", "") or candidate.get("gtin12", "") or candidate.get("gtin", ""),
+            })
+
+            products.append(item)
 
     return products
 
 
-def crawl_static_product_links(base_url, log):
-    found = set()
+def scrape_product_page(base_url, product_url, log):
+    try:
+        response = fetch_url(product_url)
+    except Exception:
+        return None
 
-    for path in COMMON_PRODUCT_LISTING_PATHS:
-        page_url = base_url.rstrip("/") + path
-        log.append(f"Checking static page: {page_url}")
+    soup = BeautifulSoup(response.text, "lxml")
 
+    json_ld_products = extract_json_ld_products(product_url, soup)
+    if json_ld_products:
+        product = json_ld_products[0]
+        product["source"] = "Product page JSON-LD"
+        product["product_url"] = product_url
+        return product
+
+    item = make_empty_product(base_url, "Product page fallback")
+
+    title = ""
+
+    selectors = [
+        "h1",
+        "[class*='product-title']",
+        "[class*='ProductTitle']",
+        "[class*='product__title']",
+        "[data-product-title]",
+    ]
+
+    for selector in selectors:
+        found = soup.select_one(selector)
+        if found:
+            title = clean_text(found.get_text())
+            if title:
+                break
+
+    if not title:
+        return None
+
+    price = ""
+
+    price_selectors = [
+        "[class*='price']",
+        "[data-price]",
+        "[itemprop='price']",
+        "meta[property='product:price:amount']",
+    ]
+
+    for selector in price_selectors:
+        found = soup.select_one(selector)
+        if found:
+            if found.name == "meta":
+                price = found.get("content", "")
+            else:
+                price = clean_text(found.get_text())
+
+            if clean_price(price):
+                break
+
+    image_url = ""
+
+    image_selectors = [
+        "meta[property='og:image']",
+        "meta[name='twitter:image']",
+        "img[class*='product']",
+        "img",
+    ]
+
+    for selector in image_selectors:
+        found = soup.select_one(selector)
+        if found:
+            image_url = found.get("content") or found.get("src") or found.get("data-src") or ""
+            image_url = normalize_url(base_url, image_url)
+            if image_url:
+                break
+
+    description = ""
+
+    desc_selectors = [
+        "meta[property='og:description']",
+        "meta[name='description']",
+        "[class*='description']",
+        "[class*='Description']",
+        "[class*='product-details']",
+    ]
+
+    for selector in desc_selectors:
+        found = soup.select_one(selector)
+        if found:
+            if found.name == "meta":
+                description = found.get("content", "")
+            else:
+                description = clean_text(found.get_text())
+
+            if description:
+                break
+
+    item.update({
+        "product_name": title,
+        "variant_name": "",
+        "price": price,
+        "currency": detect_currency(price),
+        "product_url": product_url,
+        "image_url": image_url,
+        "description": description,
+    })
+
+    return item
+
+
+def discover_sitemap_urls(base_url, log):
+    discovered = []
+
+    sitemap_candidates = [
+        urljoin(base_url.rstrip("/") + "/", "sitemap.xml"),
+        urljoin(base_url.rstrip("/") + "/", "sitemap_products_1.xml"),
+        urljoin(base_url.rstrip("/") + "/", "product-sitemap.xml"),
+    ]
+
+    for sitemap_url in sitemap_candidates:
         try:
-            response = requests.get(page_url, headers=HEADERS, timeout=20)
+            response = fetch_url(sitemap_url, timeout=15)
         except Exception:
             continue
 
-        if response.status_code != 200:
+        soup = BeautifulSoup(response.text, "xml")
+        locs = [loc.get_text(strip=True) for loc in soup.find_all("loc")]
+
+        product_locs = [
+            loc for loc in locs
+            if "/products/" in loc or "/product/" in loc or "/shop/" in loc
+        ]
+
+        if product_locs:
+            log.append(f"Sitemap discovery found {len(product_locs)} possible product URLs.")
+            discovered.extend(product_locs)
+
+    return list(dict.fromkeys(discovered))
+
+
+def discover_static_product_urls(base_url, log):
+    discovered = []
+
+    crawl_paths = [
+        "/shop/",
+        "/products/",
+        "/collections/all/",
+        "/collections/",
+        "/store/",
+    ]
+
+    for path in crawl_paths:
+        page_url = urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
+
+        try:
+            response = fetch_url(page_url, timeout=15)
+        except Exception:
             continue
 
         soup = BeautifulSoup(response.text, "lxml")
 
-        json_products = extract_json_ld_products(response.text, page_url)
-        for product in json_products:
-            if product.get("url"):
-                found.add(product["url"])
-
         for link in soup.find_all("a", href=True):
-            full_url = urljoin(base_url, link["href"])
-            clean_url = full_url.split("?")[0].split("#")[0]
+            href = link.get("href", "")
+            full_url = normalize_url(base_url, href)
 
-            if is_safe_url(clean_url) and ("/product/" in clean_url or "/products/" in clean_url):
-                found.add(clean_url.rstrip("/") + "/")
+            if not full_url:
+                continue
 
-    return list(found)
+            if any(token in full_url for token in ["/products/", "/product/", "/shop/"]):
+                discovered.append(full_url)
+
+    discovered = list(dict.fromkeys(discovered))
+
+    if discovered:
+        log.append(f"Static crawl found {len(discovered)} possible product URLs.")
+
+    return discovered
 
 
-def crawl_playwright_product_links(base_url, log):
-    if not PLAYWRIGHT_AVAILABLE:
-        log.append("Playwright is not installed. Hard-site mode unavailable.")
+def scrape_static_fallback(base_url, log):
+    product_urls = []
+
+    product_urls.extend(discover_sitemap_urls(base_url, log))
+    product_urls.extend(discover_static_product_urls(base_url, log))
+
+    product_urls = list(dict.fromkeys(product_urls))
+
+    if not product_urls:
+        log.append("No product URLs found through sitemap/static crawl.")
         return []
 
-    found = set()
+    log.append(f"Scraping up to {min(len(product_urls), 150)} product pages for better accuracy...")
+
+    products = []
+
+    for index, product_url in enumerate(product_urls[:150], start=1):
+        product = scrape_product_page(base_url, product_url, log)
+
+        if product and clean_text(product.get("product_name", "")):
+            products.append(product)
+
+        if index % 25 == 0:
+            log.append(f"Checked {index} product pages...")
+
+        time.sleep(0.15)
+
+    return products
+
+
+def scrape_with_playwright(base_url, log):
+    if not PLAYWRIGHT_AVAILABLE:
+        log.append("Playwright is not installed in this environment.")
+        return []
+
+    log.append("Starting hard-site mode with Playwright...")
+
+    products = []
+    discovered_urls = []
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page(user_agent=HEADERS["User-Agent"])
 
-            for path in COMMON_PRODUCT_LISTING_PATHS:
-                page_url = base_url.rstrip("/") + path
-                log.append(f"Rendering with browser: {page_url}")
+            entry_urls = [
+                base_url,
+                urljoin(base_url.rstrip("/") + "/", "shop/"),
+                urljoin(base_url.rstrip("/") + "/", "products/"),
+                urljoin(base_url.rstrip("/") + "/", "collections/all/"),
+            ]
 
+            for entry_url in entry_urls:
                 try:
-                    page.goto(page_url, wait_until="networkidle", timeout=30000)
-                    page.mouse.wheel(0, 2500)
-                    time.sleep(1)
+                    page.goto(entry_url, wait_until="networkidle", timeout=30000)
+
+                    for _ in range(5):
+                        page.mouse.wheel(0, 2500)
+                        page.wait_for_timeout(1000)
+
                     html = page.content()
+                    soup = BeautifulSoup(html, "lxml")
+
+                    products.extend(extract_json_ld_products(entry_url, soup))
+
+                    for link in soup.find_all("a", href=True):
+                        href = link.get("href", "")
+                        full_url = normalize_url(base_url, href)
+
+                        if any(token in full_url for token in ["/products/", "/product/", "/shop/"]):
+                            discovered_urls.append(full_url)
+
                 except Exception:
                     continue
 
-                soup = BeautifulSoup(html, "lxml")
-
-                for product in extract_json_ld_products(html, page_url):
-                    if product.get("url"):
-                        found.add(product["url"])
-
-                for link in soup.find_all("a", href=True):
-                    full_url = urljoin(base_url, link["href"])
-                    clean_url = full_url.split("?")[0].split("#")[0]
-
-                    if is_safe_url(clean_url) and ("/product/" in clean_url or "/products/" in clean_url):
-                        found.add(clean_url.rstrip("/") + "/")
-
             browser.close()
+
     except Exception as error:
-        log.append(f"Playwright error: {error}")
+        log.append(f"Playwright failed: {error}")
+        return products
 
-    return list(found)
+    discovered_urls = list(dict.fromkeys(discovered_urls))
 
+    if discovered_urls:
+        log.append(f"Playwright discovered {len(discovered_urls)} possible product URLs.")
 
-def scrape_product_page(url, use_playwright, log):
-    html = ""
+    for product_url in discovered_urls[:150]:
+        product = scrape_product_page(base_url, product_url, log)
 
-    if use_playwright and PLAYWRIGHT_AVAILABLE:
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page(user_agent=HEADERS["User-Agent"])
-                page.goto(url, wait_until="networkidle", timeout=30000)
-                html = page.content()
-                browser.close()
-        except Exception:
-            html = ""
+        if product and clean_text(product.get("product_name", "")):
+            product["source"] = "Playwright discovered page"
+            products.append(product)
 
-    if not html:
-        response = requests.get(url, headers=HEADERS, timeout=20)
-        html = response.text
+        time.sleep(0.15)
 
-    json_products = extract_json_ld_products(html, url)
-    if json_products and json_products[0].get("name"):
-        return json_products[0]
-
-    soup = BeautifulSoup(html, "lxml")
-    name = soup.select_one("h1, [class*='product-title'], [class*='ProductTitle']")
-    price = soup.select_one("[class*='price'], [class*='Price']")
-    desc = soup.select_one("[class*='description'], [class*='Description'], #tab-description")
-
-    return {
-        "name": name.get_text(" ", strip=True) if name else "",
-        "price": price.get_text(" ", strip=True) if price else "",
-        "description": desc.get_text(" ", strip=True) if desc else "",
-        "url": url,
-    }
+    return products
 
 
-def make_excel_bytes(df):
+def scrape_website(base_url, use_hard_site_mode=False, expand_variants=False):
+    log = []
+    all_products = []
+
+    if not base_url.startswith(("http://", "https://")):
+        base_url = "https://" + base_url
+
+    base_url = base_url.strip().rstrip("/")
+
+    log.append(f"Starting scrape: {base_url}")
+
+    shopify_products = scrape_shopify(base_url, log, expand_variants=expand_variants)
+    all_products.extend(shopify_products)
+
+    if not shopify_products:
+        log.append("No Shopify products found. Trying sitemap/static fallback...")
+        all_products.extend(scrape_static_fallback(base_url, log))
+    else:
+        log.append("Shopify data found. Running static discovery as a secondary accuracy pass...")
+        all_products.extend(scrape_static_fallback(base_url, log))
+
+    if use_hard_site_mode:
+        all_products.extend(scrape_with_playwright(base_url, log))
+
+    all_products = normalize_products(all_products)
+
+    log.append(f"Finished. Final unique rows: {len(all_products)}")
+
+    return all_products, log
+
+
+def prepare_dataframe(products):
+    df = pd.DataFrame(products)
+
+    for column in OUTPUT_COLUMNS:
+        if column not in df.columns:
+            df[column] = ""
+
+    df = df[OUTPUT_COLUMNS]
+
+    if not df.empty:
+        df["price_numeric"] = df["price"].apply(price_to_float)
+        df["compare_at_price_numeric"] = df["compare_at_price"].apply(price_to_float)
+
+    return df
+
+
+def apply_filters(df, in_stock_only=False, has_image_only=False, min_price=None, max_price=None, search_text=""):
+    filtered = df.copy()
+
+    if filtered.empty:
+        return filtered
+
+    if in_stock_only:
+        filtered = filtered[filtered["availability"].str.lower() == "in stock"]
+
+    if has_image_only:
+        filtered = filtered[filtered["image_url"].astype(str).str.strip() != ""]
+
+    if min_price is not None:
+        filtered = filtered[(filtered["price_numeric"].isna()) | (filtered["price_numeric"] >= min_price)]
+
+    if max_price is not None:
+        filtered = filtered[(filtered["price_numeric"].isna()) | (filtered["price_numeric"] <= max_price)]
+
+    if search_text.strip():
+        query = search_text.strip().lower()
+
+        searchable = (
+            filtered["product_name"].fillna("").astype(str).str.lower() + " " +
+            filtered["variant_name"].fillna("").astype(str).str.lower() + " " +
+            filtered["brand"].fillna("").astype(str).str.lower() + " " +
+            filtered["vendor"].fillna("").astype(str).str.lower() + " " +
+            filtered["product_type"].fillna("").astype(str).str.lower() + " " +
+            filtered["sku"].fillna("").astype(str).str.lower()
+        )
+
+        filtered = filtered[searchable.str.contains(re.escape(query), na=False)]
+
+    return filtered
+
+
+def make_export_dataframe(df, export_mode):
+    export_df = df.copy()
+
+    for helper_column in ["price_numeric", "compare_at_price_numeric"]:
+        if helper_column in export_df.columns:
+            export_df = export_df.drop(columns=[helper_column])
+
+    if export_mode == "Clean export":
+        columns = [column for column in CLEAN_EXPORT_COLUMNS if column in export_df.columns]
+    else:
+        columns = [column for column in OUTPUT_COLUMNS if column in export_df.columns]
+
+    return export_df[columns]
+
+
+def dataframe_to_excel_bytes(df):
     output = BytesIO()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Scraped Data")
-        sheet = writer.book["Scraped Data"]
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        sheet.column_dimensions["A"].width = 35
-        sheet.column_dimensions["B"].width = 15
-        sheet.column_dimensions["C"].width = 80
-        sheet.column_dimensions["D"].width = 70
+        df.to_excel(writer, index=False, sheet_name="Products")
 
-    output.seek(0)
-    return output
+    return output.getvalue()
 
 
-def save_outputs(site_name, df):
-    today = date.today().isoformat()
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    site_folder = ensure_dirs(site_name)
+def save_outputs(df, site, export_mode):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_site = re.sub(r"[^a-zA-Z0-9_-]", "_", site)
+    mode_slug = "clean" if export_mode == "Clean export" else "raw"
 
-    csv_path = os.path.join(site_folder, f"{site_name}_{today}.csv")
-    xlsx_path = os.path.join(site_folder, f"{site_name}_{today}.xlsx")
+    csv_path = os.path.join(LOGS_DIR, f"{safe_site}_{mode_slug}_{timestamp}.csv")
+    excel_path = os.path.join(LOGS_DIR, f"{safe_site}_{mode_slug}_{timestamp}.xlsx")
 
     df.to_csv(csv_path, index=False)
-    df.to_excel(xlsx_path, index=False)
+    df.to_excel(excel_path, index=False)
 
-    history_exists = os.path.exists(HISTORY_FILE)
-
-    with open(HISTORY_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not history_exists:
-            writer.writerow(["timestamp", "site", "products", "csv_path", "excel_path"])
-        writer.writerow([timestamp, site_name, len(df), csv_path, xlsx_path])
-
-    return csv_path, xlsx_path
+    return csv_path, excel_path
 
 
-def scrape_website(url, use_playwright=False):
-    log = []
-    base_url = normalize_base_url(url)
-    site_name = clean_site_name(base_url)
+def save_history(url, total_count, filtered_count, csv_path, excel_path, expand_variants, export_mode):
+    row = {
+        "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "url": url,
+        "total_rows": total_count,
+        "exported_rows": filtered_count,
+        "variant_expansion": "Yes" if expand_variants else "No",
+        "export_mode": export_mode,
+        "csv_path": csv_path,
+        "excel_path": excel_path,
+    }
 
-    log.append(f"Website: {base_url}")
-    log.append("Trying Shopify...")
-
-    products = try_shopify(base_url, log)
-
-    if products:
-        log.append(f"Shopify detected. Found {len(products)} products.")
+    if os.path.exists(HISTORY_FILE):
+        try:
+            history_df = pd.read_csv(HISTORY_FILE)
+        except Exception:
+            history_df = pd.DataFrame(columns=HISTORY_COLUMNS)
     else:
-        log.append("Shopify not detected. Trying static product crawl...")
-        product_urls = crawl_static_product_links(base_url, log)
-        log.append(f"Static crawl found {len(product_urls)} product URLs.")
+        history_df = pd.DataFrame(columns=HISTORY_COLUMNS)
 
-        if use_playwright:
-            log.append("Hard-site mode enabled. Trying browser-rendered crawl...")
-            rendered_urls = crawl_playwright_product_links(base_url, log)
-            before = len(product_urls)
-            product_urls = list(set(product_urls + rendered_urls))
-            log.append(f"Browser mode added {len(product_urls) - before} product URLs.")
+    for column in HISTORY_COLUMNS:
+        if column not in history_df.columns:
+            history_df[column] = ""
 
-        products = []
-        for product_url in product_urls:
-            try:
-                product = scrape_product_page(product_url, use_playwright, log)
-                products.append(product)
-                log.append(f"Scraped: {product_url}")
-                time.sleep(0.5)
-            except Exception as error:
-                log.append(f"Error: {product_url} — {error}")
+    history_df = history_df[HISTORY_COLUMNS]
 
-    df = pd.DataFrame(products)
+    new_row_df = pd.DataFrame([row], columns=HISTORY_COLUMNS)
+    history_df = pd.concat([history_df, new_row_df], ignore_index=True)
 
-    if not df.empty:
-        df = df.drop_duplicates(subset=["url"])
-
-    csv_path, xlsx_path = save_outputs(site_name, df)
-    return site_name, df, csv_path, xlsx_path, log
+    history_df.to_csv(HISTORY_FILE, index=False)
 
 
-st.set_page_config(page_title="Website Scraper", layout="wide")
+def load_history():
+    if not os.path.exists(HISTORY_FILE):
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
 
-st.title("Website Scraper")
-st.caption("Scrape public product data into CSV or Excel.")
+    try:
+        history_df = pd.read_csv(HISTORY_FILE)
+    except Exception:
+        return pd.DataFrame(columns=HISTORY_COLUMNS)
 
-with st.expander("Legal / ethical checklist", expanded=False):
-    st.write(
-        "Only scrape public data. Do not scrape login-only, customer, checkout, account, private, "
-        "or restricted pages. Do not bypass CAPTCHA, paywalls, or bot protections."
-    )
+    for column in HISTORY_COLUMNS:
+        if column not in history_df.columns:
+            history_df[column] = ""
 
-url = st.text_input("Website URL", placeholder="https://summerfridays.com")
-use_playwright = st.checkbox("Hard-site mode: render JavaScript pages with browser automation", value=False)
+    history_df = history_df[HISTORY_COLUMNS]
 
-if use_playwright and not PLAYWRIGHT_AVAILABLE:
-    st.warning("Playwright is not installed yet. Install it before using hard-site mode.")
+    return history_df
 
-run_button = st.button("Scrape Website", type="primary")
+
+st.set_page_config(
+    page_title="Website Product Scraper",
+    page_icon="",
+    layout="wide",
+)
+
+st.title("Website Product Scraper")
+st.write("Scrape product data from Shopify stores, product pages, sitemaps, and harder JavaScript-rendered sites.")
+
+url = st.text_input("Website URL", placeholder="https://example.com")
+
+use_hard_site_mode = st.checkbox(
+    "Hard-site mode",
+    help="Uses browser rendering with Playwright. Slower, but better for JavaScript-heavy sites.",
+)
+
+expand_variants = st.checkbox(
+    "Expand Shopify variants into separate rows",
+    value=False,
+    help="Recommended for detailed analysis. Creates one row per product variant instead of one row per product.",
+)
+
+st.subheader("Export Options")
+
+export_mode = st.radio(
+    "Export type",
+    options=["Clean export", "Raw export"],
+    index=0,
+    horizontal=True,
+)
+
+with st.expander("Filters", expanded=True):
+    filter_col_1, filter_col_2, filter_col_3 = st.columns(3)
+
+    with filter_col_1:
+        in_stock_only = st.checkbox("In-stock only", value=False)
+
+    with filter_col_2:
+        has_image_only = st.checkbox("Has image only", value=False)
+
+    with filter_col_3:
+        sort_option = st.selectbox(
+            "Sort results",
+            options=[
+                "Default",
+                "Product name A-Z",
+                "Price low to high",
+                "Price high to low",
+            ],
+        )
+
+    search_text = st.text_input("Search within results", placeholder="Search product name, variant, brand, SKU...")
+
+    price_filter_enabled = st.checkbox("Enable price filter", value=False)
+
+    min_price = None
+    max_price = None
+
+    if price_filter_enabled:
+        price_col_1, price_col_2 = st.columns(2)
+
+        with price_col_1:
+            min_price = st.number_input("Minimum price", min_value=0.0, value=0.0, step=1.0)
+
+        with price_col_2:
+            max_price = st.number_input("Maximum price", min_value=0.0, value=9999.0, step=1.0)
+
+
+run_button = st.button("Scrape Website")
 
 if run_button:
     if not url.strip():
         st.error("Enter a website URL first.")
     else:
         with st.spinner("Scraping..."):
-            site_name, df, csv_path, xlsx_path, log = scrape_website(url.strip(), use_playwright=use_playwright)
+            products, run_log = scrape_website(
+                url.strip(),
+                use_hard_site_mode=use_hard_site_mode,
+                expand_variants=expand_variants,
+            )
 
-        with st.expander("Run Log", expanded=True):
-            for line in log:
-                st.write(line)
+        st.subheader("Run Log")
+        for line in run_log:
+            st.write(line)
 
-        if df.empty:
-            st.warning("No products found. This site may need custom logic, stronger browser rendering, or manual API inspection.")
+        if not products:
+            st.warning("No products found.")
         else:
-            today = date.today().isoformat()
-            csv_name = f"{site_name}_{today}.csv"
-            xlsx_name = f"{site_name}_{today}.xlsx"
+            df = prepare_dataframe(products)
 
-            st.success(f"Found {len(df)} products.")
-            st.write(f"Auto-saved CSV: `{csv_path}`")
-            st.write(f"Auto-saved Excel: `{xlsx_path}`")
-            st.dataframe(df, width="stretch")
+            filtered_df = apply_filters(
+                df,
+                in_stock_only=in_stock_only,
+                has_image_only=has_image_only,
+                min_price=min_price,
+                max_price=max_price,
+                search_text=search_text,
+            )
 
-            csv_data = df.to_csv(index=False).encode("utf-8")
-            excel_data = make_excel_bytes(df)
+            if sort_option == "Product name A-Z":
+                filtered_df = filtered_df.sort_values(["product_name", "variant_name"], ascending=True)
 
-            col1, col2 = st.columns(2)
-            with col1:
-                st.download_button("Download CSV", data=csv_data, file_name=csv_name, mime="text/csv")
-            with col2:
-                st.download_button(
-                    "Download Excel",
-                    data=excel_data,
-                    file_name=xlsx_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            elif sort_option == "Price low to high":
+                filtered_df = filtered_df.sort_values(
+                    by=["price_numeric", "product_name"],
+                    ascending=[True, True],
+                    na_position="last",
                 )
 
+            elif sort_option == "Price high to low":
+                filtered_df = filtered_df.sort_values(
+                    by=["price_numeric", "product_name"],
+                    ascending=[False, True],
+                    na_position="last",
+                )
+
+            export_df = make_export_dataframe(filtered_df, export_mode)
+
+            site = get_site_name(url)
+            csv_path, excel_path = save_outputs(export_df, site, export_mode)
+            save_history(url, len(df), len(export_df), csv_path, excel_path, expand_variants, export_mode)
+
+            if expand_variants:
+                st.success(f"Found {len(df)} unique variant rows. Exporting {len(export_df)} filtered rows.")
+            else:
+                st.success(f"Found {len(df)} unique product rows. Exporting {len(export_df)} filtered rows.")
+
+            st.subheader("Preview")
+            st.dataframe(export_df, use_container_width=True)
+
+            csv_bytes = export_df.to_csv(index=False).encode("utf-8")
+            excel_bytes = dataframe_to_excel_bytes(export_df)
+
+            file_prefix = re.sub(r"[^a-zA-Z0-9_-]", "_", site)
+            mode_slug = "clean" if export_mode == "Clean export" else "raw"
+
+            st.download_button(
+                label="Download CSV",
+                data=csv_bytes,
+                file_name=f"{file_prefix}_{mode_slug}_products.csv",
+                mime="text/csv",
+            )
+
+            st.download_button(
+                label="Download Excel",
+                data=excel_bytes,
+                file_name=f"{file_prefix}_{mode_slug}_products.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            st.caption(f"Saved CSV locally to: {csv_path}")
+            st.caption(f"Saved Excel locally to: {excel_path}")
+
+
 st.divider()
+
 st.subheader("Scrape History")
 
-if os.path.exists(HISTORY_FILE):
-    history_df = pd.read_csv(HISTORY_FILE)
-    st.dataframe(history_df.tail(25).sort_values("timestamp", ascending=False), width="stretch")
+history_df = load_history()
+
+if history_df.empty:
+    st.write("No scrape history yet.")
 else:
-    st.caption("No scrape history yet.")
+    if "scraped_at" in history_df.columns:
+        history_df = history_df.sort_values("scraped_at", ascending=False)
+
+    st.dataframe(history_df, use_container_width=True)
