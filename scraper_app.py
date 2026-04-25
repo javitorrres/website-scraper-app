@@ -1,6 +1,6 @@
 import os
 import re
-import csv
+import uuid
 import json
 import time
 import requests
@@ -52,7 +52,10 @@ CLEAN_EXPORT_COLUMNS = [
 
 
 HISTORY_COLUMNS = [
+    "run_id",
     "scraped_at",
+    "user",
+    "site",
     "url",
     "total_rows",
     "exported_rows",
@@ -910,9 +913,14 @@ def save_outputs(df, site, export_mode):
     return csv_path, excel_path
 
 
-def save_history(url, total_count, filtered_count, csv_path, excel_path, expand_variants, export_mode):
+def save_history(url, total_count, filtered_count, csv_path, excel_path, expand_variants, export_mode, user_name):
+    site = get_site_name(url)
+
     row = {
+        "run_id": str(uuid.uuid4()),
         "scraped_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user": clean_text(user_name) or "Unknown",
+        "site": site,
         "url": url,
         "total_rows": total_count,
         "exported_rows": filtered_count,
@@ -940,6 +948,8 @@ def save_history(url, total_count, filtered_count, csv_path, excel_path, expand_
     history_df = pd.concat([history_df, new_row_df], ignore_index=True)
 
     history_df.to_csv(HISTORY_FILE, index=False)
+
+    return row["run_id"]
 
 
 def load_history():
@@ -998,7 +1008,9 @@ Local saved files are stored in:
 ~/Desktop/website-scraper-app/logs
 ```
 
-The scrape history table shows previous runs, row counts, export type, and file paths.
+The scrape history table shows previous runs, user names, row counts, export type, and file paths.
+
+On Streamlit Cloud, this history is temporary. Download the history CSV if you need to keep it.
 
 ### Data notes
 
@@ -1056,6 +1068,24 @@ expand_variants = st.checkbox(
     value=False,
     help="Recommended for detailed analysis. Creates one row per product variant instead of one row per product.",
 )
+
+st.subheader("History Options")
+
+history_col_1, history_col_2 = st.columns([1, 2])
+
+with history_col_1:
+    save_scrape_to_history = st.checkbox(
+        "Save scrape to local history",
+        value=True,
+        help="Saves a summary of each scrape to a local CSV file. On Streamlit Cloud, this may reset between sessions.",
+    )
+
+with history_col_2:
+    user_name = st.text_input(
+        "User name for history",
+        value="Javi",
+        help="Used only for the local scrape history table.",
+    )
 
 st.subheader("Export Options")
 
@@ -1155,7 +1185,22 @@ if run_button:
 
             site = get_site_name(url)
             csv_path, excel_path = save_outputs(export_df, site, export_mode)
-            save_history(url, len(df), len(export_df), csv_path, excel_path, expand_variants, export_mode)
+
+            if save_scrape_to_history:
+                try:
+                    run_id = save_history(
+                        url=url,
+                        total_count=len(df),
+                        filtered_count=len(export_df),
+                        csv_path=csv_path,
+                        excel_path=excel_path,
+                        expand_variants=expand_variants,
+                        export_mode=export_mode,
+                        user_name=user_name,
+                    )
+                    st.caption(f"Saved scrape to local history. Run ID: {run_id}")
+                except Exception as error:
+                    st.warning(f"Scrape completed, but local history save failed: {error}")
 
             if expand_variants:
                 st.success(f"Found {len(df)} unique variant rows. Exporting {len(export_df)} filtered rows.")
@@ -1202,3 +1247,12 @@ else:
         history_df = history_df.sort_values("scraped_at", ascending=False)
 
     st.dataframe(history_df, use_container_width=True)
+
+    history_csv = history_df.to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label="Download scrape history CSV",
+        data=history_csv,
+        file_name="scrape_history.csv",
+        mime="text/csv",
+    )

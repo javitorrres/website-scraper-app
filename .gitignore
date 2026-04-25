@@ -7,3 +7,4 @@ scraper_app_backup_*.py
 scraper_app_old_local_backup.py
 summerfridays/
 rhodeskin/
+.DS_Store
