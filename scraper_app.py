@@ -94,7 +94,9 @@ def try_shopify(base_url, log):
 
         for product in items:
             variants = product.get("variants", [])
-            description = BeautifulSoup(product.get("body_html", ""), "lxml").get_text(" ", strip=True)
+
+            raw_html = product.get("body_html") or ""
+            description = BeautifulSoup(str(raw_html), "lxml").get_text(" ", strip=True)
 
             products.append({
                 "name": product.get("title", ""),
@@ -355,7 +357,10 @@ st.title("Website Scraper")
 st.caption("Scrape public product data into CSV or Excel.")
 
 with st.expander("Legal / ethical checklist", expanded=False):
-    st.write("Only scrape public data. Do not scrape login-only, customer, checkout, account, private, or restricted pages. Do not bypass CAPTCHA, paywalls, or bot protections.")
+    st.write(
+        "Only scrape public data. Do not scrape login-only, customer, checkout, account, private, "
+        "or restricted pages. Do not bypass CAPTCHA, paywalls, or bot protections."
+    )
 
 url = st.text_input("Website URL", placeholder="https://summerfridays.com")
 use_playwright = st.checkbox("Hard-site mode: render JavaScript pages with browser automation", value=False)
@@ -386,7 +391,7 @@ if run_button:
             st.success(f"Found {len(df)} products.")
             st.write(f"Auto-saved CSV: `{csv_path}`")
             st.write(f"Auto-saved Excel: `{xlsx_path}`")
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(df, width="stretch")
 
             csv_data = df.to_csv(index=False).encode("utf-8")
             excel_data = make_excel_bytes(df)
@@ -395,14 +400,18 @@ if run_button:
             with col1:
                 st.download_button("Download CSV", data=csv_data, file_name=csv_name, mime="text/csv")
             with col2:
-                st.download_button("Download Excel", data=excel_data, file_name=xlsx_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button(
+                    "Download Excel",
+                    data=excel_data,
+                    file_name=xlsx_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
 
 st.divider()
 st.subheader("Scrape History")
 
 if os.path.exists(HISTORY_FILE):
     history_df = pd.read_csv(HISTORY_FILE)
-    st.dataframe(history_df.tail(25).sort_values("timestamp", ascending=False), use_container_width=True)
+    st.dataframe(history_df.tail(25).sort_values("timestamp", ascending=False), width="stretch")
 else:
     st.caption("No scrape history yet.")
-
