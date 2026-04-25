@@ -1,0 +1,9 @@
+venv/
+logs/
+.DS_Store
+__pycache__/
+*.pyc
+scraper_app_backup_*.py
+scraper_app_old_local_backup.py
+summerfridays/
+rhodeskin/
