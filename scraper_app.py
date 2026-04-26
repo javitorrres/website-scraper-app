@@ -19,7 +19,7 @@ except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
 
-BASE_OUTPUT_DIR = os.path.expanduser("~/Desktop/website-scraper-app")
+BASE_OUTPUT_DIR = os.path.dirname(os.path.abspath(__file__))
 LOGS_DIR = os.path.join(BASE_OUTPUT_DIR, "logs")
 HISTORY_FILE = os.path.join(LOGS_DIR, "app_scrape_history.csv")
 
